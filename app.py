@@ -1,4 +1,4 @@
-import os, json, hashlib, secrets, re, time, uuid, asyncio
+﻿import os, json, hashlib, secrets, re, time, uuid, asyncio
 from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -159,51 +159,201 @@ async def call_planner(payload):
         # Avoid echoing provider body, prompt, or credential-bearing details.
         raise HTTPException(status_code=502, detail="AI planning request failed; verify the configured provider endpoint, model, key, and timeout.")
 
+
+
 def make_trace(payload, state):
-    trace_id=state["trace_id"]; run_id=state["runId"]; marker=state["publicMarker"]
-    start=state["created_ns"]; now=time.time_ns()
-    spans=[]
-    server=state["server_span_id"]; agent=state["agent_span_id"]; modelspan=state["model_span_id"]
-    spans.append(span(trace_id,server,state.get("incoming_parent"),"POST /v2/incidents",2,run_id,marker,start,now))
-    spans.append(span(trace_id,agent,server,"invoke_agent incident-response",1,run_id,marker,start,now))
-    spans.append(span(trace_id,modelspan,agent,"chat incident-plan",3,run_id,marker,start,now,
-      attrs(**{"gen_ai.operation.name":"chat","gen_ai.request.model":state.get("model","configured-model")})))
-    execute_spans={}
+    trace_id = state["trace_id"]
+    run_id = state["runId"]
+    marker = state["publicMarker"]
+    start = state["created_ns"]
+    now = time.time_ns()
+
+    spans = []
+    server = state["server_span_id"]
+    agent = state["agent_span_id"]
+    modelspan = state["model_span_id"]
+
+    spans.append(
+        span(
+            trace_id, server, state.get("incoming_parent"),
+            "POST /v2/incidents", 2, run_id, marker, start, now
+        )
+    )
+
+    spans.append(
+        span(
+            trace_id, agent, server,
+            "invoke_agent incident-response", 1,
+            run_id, marker, start, now
+        )
+    )
+
+    spans.append(
+        span(
+            trace_id, modelspan, agent,
+            "chat incident-plan", 3,
+            run_id, marker, start, now,
+            attrs(**{
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": state.get("model", "configured-model")
+            })
+        )
+    )
+
+    execute_spans = {}
+    used_span_ids = {server, agent, modelspan}
+
+    def new_span_id():
+        while True:
+            candidate = hexid(8)
+            if candidate != "0" * 16 and candidate not in used_span_ids:
+                used_span_ids.add(candidate)
+                return candidate
+
+    # One INTERNAL execute_tool span per logical action.
     for action in state["actionLog"]:
-        aid=action["actionId"]; cid=action["callId"]
-        if aid not in execute_spans:
-            exid=hexid(8); execute_spans[aid]=exid
-            spans.append(span(trace_id,exid,agent,"execute_tool "+action["toolName"],1,run_id,marker,start,now,
-                attrs(**{"ga5.action.id":aid,"gen_ai.tool.name":action["toolName"],"gen_ai.tool.call.id":cid,
-                         "gen_ai.operation.name":"execute_tool"})))
-        # One CLIENT span per physical attempt; correlate from the recorded dispatch/receipt.
-        receipt=next((r for r in state["receiptLog"] if r.get("actionId")==aid and r.get("callId")==cid and r.get("attempt")==action["attempt"]),{})
-        cspan=action.get("_clientSpanId") or hexid(8)
-        action["_clientSpanId"]=cspan
-        status=receipt.get("status")
-        error_type=None
-        if status==503: error_type="503"
-        elif status==0: error_type="timeout"
-        a={"ga5.action.id":aid,"ga5.attempt":action["attempt"],"ga5.receipt.id":receipt.get("receiptId"),
-           "ga5.receipt.nonce":receipt.get("nonce"),"http.request.method":"POST",
-           "http.request.resend_count":action["attempt"]-1,"http.response.status_code":status,
-           "error.type":error_type}
-        spans.append(span(trace_id,cspan,execute_spans[aid],"POST tool/"+action["toolName"],3,run_id,marker,start,now,
-                          attrs(**a),status=2 if error_type else 0))
-    diag_by_action={a["actionId"]:a for a in state["actionLog"] if a.get("phase")=="diagnostic"}
-    if len(diag_by_action)>1:
-        links=[]
-        for a in diag_by_action.values():
-            if a["actionId"] in execute_spans:
-                links.append({"traceId":trace_id,"spanId":execute_spans[a["actionId"]]})
-        spans.append(span(trace_id,hexid(8),agent,"incident.join",1,run_id,marker,start,now,links=links))
-    for rec in state["receiptLog"]:
-        if "approvalId" in rec:
-            spans.append(span(trace_id,hexid(8),agent,"approval_gate",1,run_id,marker,start,now,
-              attrs(**{"ga5.approval.id":rec["approvalId"],"ga5.approval.receipt.nonce":rec.get("nonce"),
-                       "ga5.approval.decision":rec.get("decision")})))
-    return {"resourceSpans":[{"resource":{"attributes":attrs(**{"service.name":"incident-response-agent"})},
-                              "scopeSpans":[{"scope":{"name":"incident-response-agent"},"spans":spans}]}]}
+        action_id = action["actionId"]
+        call_id = action["callId"]
+        tool_name = action["toolName"]
+
+        if action_id not in execute_spans:
+            execute_id = new_span_id()
+            execute_spans[action_id] = execute_id
+
+            spans.append(
+                span(
+                    trace_id, execute_id, agent,
+                    "execute_tool " + tool_name, 1,
+                    run_id, marker, start, now,
+                    attrs(**{
+                        "ga5.action.id": action_id,
+                        "gen_ai.tool.name": tool_name,
+                        "gen_ai.tool.call.id": call_id,
+                        "gen_ai.operation.name": "execute_tool"
+                    })
+                )
+            )
+
+        # Find the outcome for this exact physical attempt.
+        receipt = next(
+            (
+                item for item in state["receiptLog"]
+                if item.get("actionId") == action_id
+                and item.get("callId") == call_id
+                and item.get("attempt") == action.get("attempt", 1)
+            ),
+            None
+        )
+
+        client_id = action.get("_clientSpanId")
+        if not client_id or client_id in used_span_ids:
+            client_id = new_span_id()
+            action["_clientSpanId"] = client_id
+            action["traceparent"] = (
+                f'00-{trace_id}-{client_id}-01'
+            )
+        else:
+            used_span_ids.add(client_id)
+
+        outcome_status = receipt.get("status") if receipt else None
+        error_type = None
+        span_status = 0
+
+        if receipt:
+            if outcome_status == 0:
+                error_type = "timeout"
+                span_status = 2
+            elif outcome_status is not None and not 200 <= outcome_status < 300:
+                error_type = str(outcome_status)
+                span_status = 2
+
+        client_attributes = {
+            "ga5.action.id": action_id,
+            "ga5.attempt": action.get("attempt", 1),
+            "ga5.receipt.id": receipt.get("receiptId") if receipt else None,
+            "ga5.receipt.nonce": receipt.get("nonce") if receipt else None,
+            "http.request.method": "POST",
+            "http.request.resend_count": action.get("attempt", 1) - 1,
+            "error.type": error_type
+        }
+
+        # A timeout has no HTTP response status code.
+        if outcome_status is not None and outcome_status != 0:
+            client_attributes["http.response.status_code"] = outcome_status
+
+        spans.append(
+            span(
+                trace_id, client_id, execute_spans[action_id],
+                "POST tool/" + tool_name, 3,
+                run_id, marker, start, now,
+                attrs(**client_attributes),
+                status=span_status
+            )
+        )
+
+    # The join is a child of the agent span and links to each
+    # independent logical diagnostic execution.
+    diagnostic_actions = {}
+    for action in state["actionLog"]:
+        if action.get("phase") == "diagnostic":
+            diagnostic_actions[action["actionId"]] = action
+
+    if len(diagnostic_actions) > 1:
+        links = [
+            {
+                "traceId": trace_id,
+                "spanId": execute_spans[action_id]
+            }
+            for action_id in diagnostic_actions
+            if action_id in execute_spans
+        ]
+
+        spans.append(
+            span(
+                trace_id, new_span_id(), agent,
+                "incident.join", 1,
+                run_id, marker, start, now,
+                links=links
+            )
+        )
+
+    # Record approval decisions with their approval receipt nonce.
+    for receipt in state["receiptLog"]:
+        if "approvalId" not in receipt:
+            continue
+
+        spans.append(
+            span(
+                trace_id, new_span_id(), agent,
+                "approval_gate", 1,
+                run_id, marker, start, now,
+                attrs(**{
+                    "ga5.approval.id": receipt["approvalId"],
+                    "ga5.receipt.id": receipt.get("receiptId"),
+                    "ga5.receipt.nonce": receipt.get("nonce"),
+                    "ga5.approval.decision": receipt.get("decision")
+                })
+            )
+        )
+
+    return {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": attrs(
+                        **{"service.name": "incident-response-agent"}
+                    )
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "incident-response-agent"},
+                        "spans": spans
+                    }
+                ]
+            }
+        ]
+    }
+
 
 def build_dispatch(state, tool, args, phase, evidence=None, attempt=1, approval=None):
     aid=state.get("reserved_action_id") if approval else None
